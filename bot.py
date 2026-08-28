@@ -10,31 +10,32 @@ from flask import Flask
 import requests
 
 # ============================================================
-# KONFIGURACJA FILTRÓW
+# KONFIGURACJA FILTRÓW (EDYTUJ WEDŁUG UZNANIA)
 # ============================================================
 
-SCAN_INTERVAL = 30          # Czas między skanami (sekundy)
+SCAN_INTERVAL = 30          # Czas między skanami (w sekundach)
 SEARCH_TEXT = "iphone"      # Szukana fraza
-MAX_RESULTS = 30            # Liczba pobieranych ogłoszeń
+MAX_RESULTS = 30            # Liczba pobieranych ogłoszeń na skan
 
-# Minimalna cena w PLN (odrzuca akcesoria, case'y, etui)
+# Minimalna cena w PLN (odrzuca etui, szkła, akcesoria)
 MIN_PRICE = 150.0  
 
-# Czarna lista słów – jeśli tytuł zawiera któreś ze słów, ogłoszenie jest odrzucane
+# Czarna lista – odrzuca ogłoszenia zawierające poniższe słowa
 EXCLUDE_KEYWORDS = [
     "etui", "case", "szkło", "szklo", "obudowa", "ładowarka", "ladowarka",
     "kabel", "pudełko", "pudelko", "box", "folia", "pokrowiec", "uchwyt",
-    "szybka", "bateria", "adapter", "zaslepka", "zaślepka", "pasek", "smycz"
+    "szybka", "bateria", "adapter", "zaslepka", "zaślepka", "pasek", "smycz",
+    "głośnik", "glosnik", "airpods", "watch", "magsafe", "pancerna", "szkiełko"
 ]
 
-# Wolne akceptowane modele (możesz edytować)
-MODEL_KEYWORDS = ["iphone 11", "iphone 12", "iphone 13", "iphone 14", "iphone 15", "iphone 16", "iphone 17"]
-
 # ============================================================
-# LOGOWANIE & FLASK
+# LOGOWANIE & FLASK (KEEP-ALIVE DLA RENDERA)
 # ============================================================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 log = logging.getLogger("iphone-bot")
 
 app = Flask(__name__)
@@ -48,11 +49,11 @@ def start_web_server():
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ============================================================
-# POMOCNIKI FILTROWANIA
+# LOGIKA FILTROWANIA I PRZETWARZANIA DANYCH
 # ============================================================
 
 def extract_price(price_input):
-    """Wyciąga kwotę jako liczbę z dowolnego ciągu znaków/typu."""
+    """Wyciąga kwotę jako liczbę float z dowolnego formatu tekstu/liczby."""
     if isinstance(price_input, (int, float)):
         return float(price_input)
     clean_str = re.sub(r"[^\d.,]", "", str(price_input)).replace(",", ".")
@@ -62,25 +63,25 @@ def extract_price(price_input):
         return 0.0
 
 def is_valid_phone(title, price_val):
-    """Sprawdza, czy oferta to prawdziwy telefon, a nie akcesorium."""
+    """Weryfikuje czy oferta dotyczy telefonu iPhone 11-17, odrzucając akcesoria."""
     title_lower = title.lower()
 
-    # 1. Sprawdzanie czarnej listy
+    # 1. Sprawdzenie czarnej listy (etui, akcesoria)
     if any(kw in title_lower for kw in EXCLUDE_KEYWORDS):
         return False
 
-    # 2. Sprawdzanie minimalnej ceny
+    # 2. Sprawdzenie minimalnej ceny
     if price_val < MIN_PRICE:
         return False
 
-    # 3. Sprawdzanie czy tytuł zawiera dopasowanie do modelu
-    if not any(m in title_lower for m in MODEL_KEYWORDS):
+    # 3. Wyłapywanie modeli iPhone 11 do 17 (np. "iphone 11", "iphone12", "iPhone 15 Pro Max")
+    if not re.search(r"iphone\s*(1[1-7])", title_lower):
         return False
 
     return True
 
 # ============================================================
-# DISCORD
+# DISCORD WEBHOOK
 # ============================================================
 
 def get_webhook():
@@ -90,6 +91,7 @@ def get_webhook():
 async def send_discord(title, price, url, image="", source=""):
     webhook = get_webhook()
     if not webhook:
+        log.error("❌ Brak ustawionego DISCORD_WEBHOOK!")
         return False
 
     color = 23295 if source == "OLX" else 38550
@@ -104,12 +106,17 @@ async def send_discord(title, price, url, image="", source=""):
         embed["thumbnail"] = {"url": image}
 
     try:
-        status = await asyncio.to_thread(lambda: requests.post(webhook, json={"embeds": [embed]}, timeout=10).status_code)
+        def _post():
+            resp = requests.post(webhook, json={"embeds": [embed]}, timeout=10)
+            return resp.status_code
+
+        status = await asyncio.to_thread(_post)
         if 200 <= status < 300:
-            log.info(f"🚀 DISCORD: wysłano [{source}] {title[:30]}")
+            log.info(f"🚀 DISCORD: wysłano [{source}] {title[:35]}")
             return True
+        log.error(f"❌ Discord Kod: {status}")
     except Exception as e:
-        log.error(f"❌ Błąd Discord: {e}")
+        log.error(f"❌ Błąd wysyłania do Discorda: {e}")
     return False
 
 # ============================================================
@@ -153,16 +160,16 @@ def _fetch_vinted():
                     "price": f"{price_num:.0f} PLN",
                     "image": image
                 })
+        else:
+            log.warning(f"⚠️ Vinted HTTP {resp.status_code}")
     except Exception as e:
-        log.warning(f"⚠️ Vinted błąd: {e}")
+        log.warning(f"⚠️ Vinted Błąd: {e}")
 
     return found
 
 def _fetch_olx():
     found = []
     url = f"https://www.olx.pl/api/v1/offers/?offset=0&limit={MAX_RESULTS}&query={quote(SEARCH_TEXT)}&sort_by=created_at:desc"
-    
-    # Nagłówki udające przeglądarkę pod Cloudflare OLX
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -201,9 +208,9 @@ def _fetch_olx():
                     "image": image
                 })
         else:
-            log.warning(f"⚠️ OLX HTTP {resp.status_code}")
+            log.warning(f"⚠️ OLX HTTP {resp.status_code} (Cloudflare blokuje IP Rendera)")
     except Exception as e:
-        log.warning(f"⚠️ OLX błąd: {e}")
+        log.warning(f"⚠️ OLX Błąd: {e}")
 
     return found
 
@@ -213,7 +220,7 @@ def _fetch_olx():
 
 async def run_bot():
     if not get_webhook():
-        log.error("❌ Brak DISCORD_WEBHOOK w enviroment variables!")
+        log.error("❌ BRAK DISCORD_WEBHOOK W USTAWIENIACH RENDERA!")
         return
 
     known_ids = set()
@@ -236,6 +243,7 @@ async def run_bot():
 
             known_ids.add(offer_id)
 
+            # Podczas pierwszego skanu tylko zapamiętujemy stare oferty – powiadomienia idą dopiero na nowe
             if not first_scan:
                 new_count += 1
                 await send_discord(
@@ -248,15 +256,22 @@ async def run_bot():
                 await asyncio.sleep(0.3)
 
         if first_scan:
-            log.info(f"🟢 PIERWSZY SKAN: zapamiętano {len(known_ids)} unikalnych telefonów.")
+            log.info(f"🟢 PIERWSZY SKAN ZAKOŃCZONY: Zapamiętano {len(known_ids)} obecnych ofert (nie wysłano ich).")
             first_scan = False
         else:
-            log.info(f"🚨 NOWYCH OFERT: {new_count}")
+            log.info(f"🚨 WYSŁANO NOWYCH OFERT: {new_count}")
 
         elapsed = time.monotonic() - scan_start
         sleep_time = max(0.0, SCAN_INTERVAL - elapsed)
+        log.info(f"⏱️ Skan trwał {elapsed:.1f}s. Następny za {sleep_time:.1f}s.")
         await asyncio.sleep(sleep_time)
 
+# ============================================================
+# START
+# ============================================================
+
 if __name__ == "__main__":
-    threading.Thread(target=start_web_server, daemon=True).start()
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
+
     asyncio.run(run_bot())
