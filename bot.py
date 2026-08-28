@@ -3,21 +3,35 @@ import asyncio
 import logging
 import threading
 import time
-from urllib.parse import quote
+import re
+from urllib.parse import quote, urljoin
 
 import requests
 from flask import Flask
 from playwright.async_api import async_playwright
 
 
+# ============================================================
+# KONFIGURACJA
+# ============================================================
+
 SCAN_INTERVAL = 15
 
-SEARCHES = ["iphone"]
+# JEDNO WSPÓLNE WYSZUKIWANIE
+SEARCH_TEXT = "iphone"
 
-MAX_RESULTS = 30
+# Interesują nas iPhone 11-17
+MIN_IPHONE = 11
+MAX_IPHONE = 17
+
+MAX_RESULTS_PER_SITE = 100
 
 PLAYWRIGHT_TIMEOUT = 10000
 
+
+# ============================================================
+# LOGOWANIE
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +40,10 @@ logging.basicConfig(
 
 log = logging.getLogger("iphone-bot")
 
+
+# ============================================================
+# FLASK
+# ============================================================
 
 app = Flask(__name__)
 
@@ -46,6 +64,10 @@ def start_web_server():
     )
 
 
+# ============================================================
+# DISCORD
+# ============================================================
+
 def get_webhook():
     webhook = os.environ.get("DISCORD_WEBHOOK")
 
@@ -55,18 +77,19 @@ def get_webhook():
     return webhook
 
 
-def send_discord(title, price, url, image, source):
+def send_discord(title, price, url, image=None, source=""):
     webhook = get_webhook()
 
     if not webhook:
-        log.error("Brak DISCORD_WEBHOOK")
-        return
+        log.error("❌ Brak DISCORD_WEBHOOK.")
+        return False
 
     embed = {
         "title": (title or "Nowe ogłoszenie")[:256],
         "url": url,
+        "color": 5814783 if source == "OLX" else 65490,
         "description": (
-            f"💰 **Cena:** {price or 'Brak ceny'}\n"
+            f"💰 **Cena:** {price or 'Brak informacji'}\n"
             f"🌐 **Źródło:** {source}"
         ),
         "footer": {
@@ -75,7 +98,9 @@ def send_discord(title, price, url, image, source):
     }
 
     if image and image.startswith("http"):
-        embed["thumbnail"] = {"url": image}
+        embed["thumbnail"] = {
+            "url": image
+        }
 
     try:
         response = requests.post(
@@ -86,34 +111,48 @@ def send_discord(title, price, url, image, source):
 
         if 200 <= response.status_code < 300:
             log.info(
-                f"✅ Discord [{source}] -> {title[:50]}"
+                f"✅ Discord [{source}]: wysłano -> "
+                f"{(title or 'Ogłoszenie')[:60]}"
             )
-        else:
-            log.error(
-                f"Discord HTTP {response.status_code}: "
-                f"{response.text[:300]}"
-            )
+            return True
+
+        log.error(
+            f"❌ Discord HTTP {response.status_code}: "
+            f"{response.text[:300]}"
+        )
 
     except Exception as e:
-        log.error(f"Discord error: {e}")
+        log.error(f"❌ Discord error: {e}")
 
+    return False
+
+
+# ============================================================
+# WIADOMOŚĆ TESTOWA
+# ============================================================
 
 def send_test_message():
     webhook = get_webhook()
 
     if not webhook:
-        log.error("Brak DISCORD_WEBHOOK")
-        return
+        log.error("❌ Brak DISCORD_WEBHOOK.")
+        return False
 
     payload = {
         "embeds": [
             {
                 "title": "🟢 iPhone Flip Bot — TEST",
                 "description": (
-                    "Bot działa.\n"
-                    "Rozpoczynam skanowanie OLX + Vinted."
+                    "Bot uruchomił się poprawnie.\n\n"
+                    "🔎 Wspólne wyszukiwanie: iPhone\n"
+                    "📱 Modele: iPhone 11–17\n"
+                    "🌐 OLX + Vinted\n"
+                    "⏱️ Skan co 15 sekund"
                 ),
-                "color": 3066993
+                "color": 3066993,
+                "footer": {
+                    "text": "iPhone Flip Bot"
+                }
             }
         ]
     }
@@ -127,21 +166,77 @@ def send_test_message():
 
         if 200 <= response.status_code < 300:
             log.info("✅ Discord: wiadomość testowa wysłana")
-        else:
-            log.error(
-                f"❌ Discord test HTTP {response.status_code}"
-            )
+            return True
+
+        log.error(
+            f"❌ Discord test HTTP {response.status_code}: "
+            f"{response.text[:300]}"
+        )
 
     except Exception as e:
         log.error(f"❌ Discord test error: {e}")
 
+    return False
+
+
+# ============================================================
+# SPRAWDZANIE CZY TO IPHONE 11-17
+# ============================================================
+
+def is_target_iphone(title):
+    if not title:
+        return False
+
+    text = title.lower()
+
+    # Musi wystąpić "iphone"
+    if "iphone" not in text:
+        return False
+
+    # Szukamy numeru modelu 11-17
+    matches = re.findall(r"\b(1[1-7])\b", text)
+
+    for number in matches:
+        model = int(number)
+
+        if MIN_IPHONE <= model <= MAX_IPHONE:
+            return True
+
+    return False
+
+
+# ============================================================
+# NORMALIZACJA URL
+# ============================================================
+
+def normalize_url(base, href):
+    if not href:
+        return ""
+
+    href = href.strip()
+
+    if href.startswith("javascript:"):
+        return ""
+
+    full_url = urljoin(base, href)
+
+    # Usuwamy parametry śledzące
+    full_url = full_url.split("?")[0]
+
+    return full_url
+
+
+# ============================================================
+# OLX
+# ============================================================
 
 async def scan_olx(page):
-    results = []
+    found = []
 
     url = (
         "https://www.olx.pl/d/elektronika/telefony/"
-        "telefony-komorkowe/q-iphone/"
+        "telefony-komorkowe/"
+        f"q-{quote(SEARCH_TEXT)}/"
         "?search%5Border%5D=created_at:desc"
     )
 
@@ -154,82 +249,264 @@ async def scan_olx(page):
             timeout=PLAYWRIGHT_TIMEOUT
         )
 
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(2500)
 
-        cards = page.locator('[data-cy="l-card"]')
+        # ----------------------------------------------------
+        # OLX: najpierw próbujemy stary selektor
+        # ----------------------------------------------------
 
-        total = await cards.count()
+        cards = await page.locator(
+            '[data-cy="l-card"]'
+        ).all()
 
-        log.info(f"OLX: parser widzi {total} kart")
+        log.info(
+            f"OLX: parser l-card widzi {len(cards)} kart"
+        )
 
-        for i in range(min(total, MAX_RESULTS)):
+        # ----------------------------------------------------
+        # JEŚLI 0 — używamy alternatywnego parsera
+        # ----------------------------------------------------
+
+        if not cards:
+            cards = await page.locator(
+                'a[href*="/d/oferta/"]'
+            ).all()
+
+            log.info(
+                f"OLX: alternatywny parser widzi "
+                f"{len(cards)} linków ofert"
+            )
+
+            seen = set()
+
+            for link in cards:
+                try:
+                    href = await link.get_attribute("href")
+
+                    full_url = normalize_url(
+                        "https://www.olx.pl",
+                        href
+                    )
+
+                    if not full_url:
+                        continue
+
+                    if "/d/oferta/" not in full_url:
+                        continue
+
+                    if full_url in seen:
+                        continue
+
+                    seen.add(full_url)
+
+                    title = await link.inner_text()
+
+                    title = " ".join(
+                        (title or "").split()
+                    )
+
+                    if not is_target_iphone(title):
+                        continue
+
+                    # Szukamy ceny w rodzicu/linku
+                    parent = link.locator("xpath=..")
+
+                    parent_text = ""
+
+                    try:
+                        parent_text = await parent.inner_text()
+                    except Exception:
+                        pass
+
+                    price = "Brak ceny"
+
+                    price_match = re.search(
+                        r"(\d[\d\s]*)(?:\s*)(zł|PLN)",
+                        parent_text,
+                        re.IGNORECASE
+                    )
+
+                    if price_match:
+                        price = (
+                            price_match.group(1).strip()
+                            + " "
+                            + price_match.group(2)
+                        )
+
+                    image = ""
+
+                    try:
+                        img = link.locator("img").first
+
+                        if await img.count() > 0:
+                            image = (
+                                await img.get_attribute("src")
+                                or ""
+                            )
+                    except Exception:
+                        pass
+
+                    found.append(
+                        {
+                            "source": "OLX",
+                            "url": full_url,
+                            "title": title[:256],
+                            "price": price,
+                            "image": image
+                        }
+                    )
+
+                    if len(found) >= MAX_RESULTS_PER_SITE:
+                        break
+
+                except Exception:
+                    continue
+
+            log.info(
+                f"OLX: znaleziono {len(found)} poprawnych ofert"
+            )
+
+            return found
+
+        # ----------------------------------------------------
+        # NORMALNY PARSER KART OLX
+        # ----------------------------------------------------
+
+        seen = set()
+
+        for card in cards:
             try:
-                card = cards.nth(i)
+                link_elem = card.locator(
+                    'a[href*="/d/oferta/"]'
+                ).first
 
-                link = card.locator("a").first
-                href = await link.get_attribute("href")
+                if await link_elem.count() == 0:
+                    link_elem = card.locator("a").first
 
-                if not href:
+                if await link_elem.count() == 0:
                     continue
 
-                if "/d/oferta/" not in href:
-                    continue
+                href = await link_elem.get_attribute("href")
 
-                if href.startswith("/"):
-                    href = "https://www.olx.pl" + href
-
-                href = href.split("?")[0]
-
-                title_el = card.locator("h6, h4").first
-
-                if await title_el.count():
-                    title = (await title_el.inner_text()).strip()
-                else:
-                    title = "iPhone - OLX"
-
-                price_el = card.locator(
-                    '[data-testid="ad-price"]'
+                full_url = normalize_url(
+                    "https://www.olx.pl",
+                    href
                 )
 
-                if await price_el.count():
-                    price = (await price_el.inner_text()).strip()
+                if not full_url:
+                    continue
+
+                if "/d/oferta/" not in full_url:
+                    continue
+
+                if full_url in seen:
+                    continue
+
+                seen.add(full_url)
+
+                # Cały tekst karty
+                try:
+                    card_text = await card.inner_text()
+                except Exception:
+                    card_text = ""
+
+                card_text = " ".join(
+                    card_text.split()
+                )
+
+                # Tytuł
+                title_elem = card.locator(
+                    "h6, h5, h4, [data-cy='ad-card-title']"
+                ).first
+
+                if await title_elem.count() > 0:
+                    title = await title_elem.inner_text()
+                else:
+                    title = card_text[:200]
+
+                title = " ".join(
+                    (title or "").split()
+                )
+
+                if not is_target_iphone(title):
+                    continue
+
+                # Cena
+                price_elem = card.locator(
+                    '[data-testid="ad-price"]'
+                ).first
+
+                if await price_elem.count() > 0:
+                    price = await price_elem.inner_text()
+                    price = " ".join(price.split())
                 else:
                     price = "Brak ceny"
 
-                img = card.locator("img").first
+                    price_match = re.search(
+                        r"(\d[\d\s]*)(?:\s*)(zł|PLN)",
+                        card_text,
+                        re.IGNORECASE
+                    )
 
-                if await img.count():
-                    image = await img.get_attribute("src")
-                else:
-                    image = ""
+                    if price_match:
+                        price = (
+                            price_match.group(1).strip()
+                            + " "
+                            + price_match.group(2)
+                        )
 
-                results.append({
-                    "source": "OLX",
-                    "url": href,
-                    "title": title,
-                    "price": price,
-                    "image": image or ""
-                })
+                # Obrazek
+                image = ""
 
-            except Exception as e:
-                log.debug(f"OLX karta: {e}")
+                try:
+                    img_elem = card.locator("img").first
+
+                    if await img_elem.count() > 0:
+                        image = (
+                            await img_elem.get_attribute("src")
+                            or ""
+                        )
+                except Exception:
+                    pass
+
+                found.append(
+                    {
+                        "source": "OLX",
+                        "url": full_url,
+                        "title": title[:256],
+                        "price": price,
+                        "image": image
+                    }
+                )
+
+                if len(found) >= MAX_RESULTS_PER_SITE:
+                    break
+
+            except Exception:
+                continue
+
+        log.info(
+            f"OLX: znaleziono {len(found)} poprawnych ofert"
+        )
 
     except Exception as e:
-        log.error(f"❌ OLX error: {e}")
+        log.warning(
+            f"⚠️ OLX błąd: {type(e).__name__}: {e}"
+        )
 
-    log.info(
-        f"OLX: znaleziono {len(results)} poprawnych ofert"
-    )
+    return found
 
-    return results
 
+# ============================================================
+# VINTED
+# ============================================================
 
 async def scan_vinted(page):
-    results = []
+    found = []
 
     url = (
         "https://www.vinted.pl/catalog"
-        "?search_text=iphone"
+        f"?search_text={quote(SEARCH_TEXT)}"
         "&order=newest_first"
     )
 
@@ -242,83 +519,184 @@ async def scan_vinted(page):
             timeout=PLAYWRIGHT_TIMEOUT
         )
 
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(2500)
 
-        items = page.locator(
+        # Najpierw obecny selektor
+        items = await page.locator(
             '[data-testid="grid-item"]'
+        ).all()
+
+        log.info(
+            f"Vinted: parser widzi {len(items)} kart"
         )
 
-        total = await items.count()
+        # ----------------------------------------------------
+        # ALTERNATYWNY PARSER JEŚLI GRID-ITEM ZNIKNIE
+        # ----------------------------------------------------
 
-        log.info(f"Vinted: parser widzi {total} kart")
+        if not items:
+            items = await page.locator(
+                'a[href*="/items/"]'
+            ).all()
 
-        for i in range(min(total, MAX_RESULTS)):
+            log.info(
+                f"Vinted: alternatywny parser widzi "
+                f"{len(items)} linków"
+            )
+
+        seen = set()
+
+        for item in items:
             try:
-                item = items.nth(i)
+                # ------------------------------------------------
+                # Ustalamy link
+                # ------------------------------------------------
 
-                link = item.locator("a").first
+                if await item.get_attribute("href"):
+                    link_elem = item
+                else:
+                    link_elem = item.locator(
+                        'a[href*="/items/"]'
+                    ).first
 
-                href = await link.get_attribute("href")
-
-                if not href:
+                if await link_elem.count() == 0:
                     continue
 
-                if "/items/" not in href:
+                href = await link_elem.get_attribute("href")
+
+                full_url = normalize_url(
+                    "https://www.vinted.pl",
+                    href
+                )
+
+                if not full_url:
                     continue
 
-                if href.startswith("/"):
-                    href = "https://www.vinted.pl" + href
+                if "/items/" not in full_url:
+                    continue
 
-                href = href.split("?")[0]
+                if full_url in seen:
+                    continue
 
-                title = await link.get_attribute("title")
+                seen.add(full_url)
+
+                # ------------------------------------------------
+                # Tytuł
+                # ------------------------------------------------
+
+                title = ""
+
+                try:
+                    title = await link_elem.get_attribute(
+                        "title"
+                    )
+                except Exception:
+                    pass
 
                 if not title:
                     try:
-                        text = await item.inner_text()
-                        title = text.split("\n")[0]
+                        title = await item.inner_text()
                     except Exception:
-                        title = "iPhone - Vinted"
+                        title = ""
 
-                price_el = item.locator(
-                    '[data-testid*="price"]'
+                title = " ".join(
+                    (title or "").split()
                 )
 
-                if await price_el.count():
-                    price = (await price_el.inner_text()).strip()
-                else:
-                    price = "Brak ceny"
+                # ------------------------------------------------
+                # WAŻNE:
+                # Vinted potrafi mieć tytuł + cenę w jednym tekście.
+                # Szukamy iphone 11-17 w całej karcie.
+                # ------------------------------------------------
 
-                img = item.locator("img").first
+                if not is_target_iphone(title):
+                    continue
 
-                if await img.count():
-                    image = await img.get_attribute("src")
-                else:
-                    image = ""
+                # ------------------------------------------------
+                # Cena
+                # ------------------------------------------------
 
-                results.append({
-                    "source": "Vinted",
-                    "url": href,
-                    "title": title.strip(),
-                    "price": price,
-                    "image": image or ""
-                })
+                price = "Brak ceny"
 
-            except Exception as e:
-                log.debug(f"Vinted karta: {e}")
+                try:
+                    price_elem = item.locator(
+                        '[data-testid*="price"]'
+                    ).first
+
+                    if await price_elem.count() > 0:
+                        price = await price_elem.inner_text()
+                        price = " ".join(price.split())
+                except Exception:
+                    pass
+
+                # Jeżeli selektor ceny nie działa
+                if price == "Brak ceny":
+                    price_match = re.search(
+                        r"(\d[\d\s]*[,.]?\d*)\s*(zł|PLN)",
+                        title,
+                        re.IGNORECASE
+                    )
+
+                    if price_match:
+                        price = (
+                            price_match.group(1).strip()
+                            + " "
+                            + price_match.group(2)
+                        )
+
+                # ------------------------------------------------
+                # Obrazek
+                # ------------------------------------------------
+
+                image = ""
+
+                try:
+                    img_elem = item.locator("img").first
+
+                    if await img_elem.count() > 0:
+                        image = (
+                            await img_elem.get_attribute("src")
+                            or ""
+                        )
+                except Exception:
+                    pass
+
+                found.append(
+                    {
+                        "source": "Vinted",
+                        "url": full_url,
+                        "title": title[:256],
+                        "price": price,
+                        "image": image
+                    }
+                )
+
+                if len(found) >= MAX_RESULTS_PER_SITE:
+                    break
+
+            except Exception:
+                continue
+
+        log.info(
+            f"Vinted: znaleziono {len(found)} poprawnych ofert"
+        )
 
     except Exception as e:
-        log.error(f"❌ Vinted error: {e}")
+        log.warning(
+            f"⚠️ Vinted błąd: {type(e).__name__}: {e}"
+        )
 
-    log.info(
-        f"Vinted: znaleziono {len(results)} poprawnych ofert"
-    )
+    return found
 
-    return results
 
+# ============================================================
+# WSPÓLNY SKAN
+# ============================================================
 
 async def scan_both(olx_page, vinted_page):
-    log.info("🔎 OLX + VINTED — SKAN RÓWNOCZESNY")
+    log.info(
+        "🔎 OLX + VINTED — SKAN RÓWNOCZESNY"
+    )
 
     olx_task = asyncio.create_task(
         scan_olx(olx_page)
@@ -328,29 +706,60 @@ async def scan_both(olx_page, vinted_page):
         scan_vinted(vinted_page)
     )
 
-    olx_results, vinted_results = await asyncio.gather(
+    results = await asyncio.gather(
         olx_task,
-        vinted_task
+        vinted_task,
+        return_exceptions=True
     )
+
+    olx_results = []
+    vinted_results = []
+
+    if isinstance(results[0], Exception):
+        log.error(
+            f"❌ OLX — błąd całego skanu: "
+            f"{results[0]}"
+        )
+    else:
+        olx_results = results[0]
+
+    if isinstance(results[1], Exception):
+        log.error(
+            f"❌ Vinted — błąd całego skanu: "
+            f"{results[1]}"
+        )
+    else:
+        vinted_results = results[1]
 
     return olx_results + vinted_results
 
 
+# ============================================================
+# GŁÓWNA PĘTLA
+# ============================================================
+
 async def run_bot():
-    if not get_webhook():
-        log.error("❌ Brak DISCORD_WEBHOOK")
+    webhook = get_webhook()
+
+    if not webhook:
+        log.error(
+            "❌ DISCORD_WEBHOOK nie został znaleziony."
+        )
         return
 
     log.info("======================================")
     log.info("📱 IPHONE FLIP BOT")
     log.info("OLX + VINTED")
     log.info("🔎 WSPÓLNE WYSZUKIWANIE: IPHONE")
+    log.info("📱 MODELE: IPHONE 11–17")
     log.info("⏱️ SKAN CO 15 SEKUND")
     log.info("======================================")
 
+    # Test Discorda — zostawiamy, skoro działa
     send_test_message()
 
     known = set()
+    first_scan = True
 
     async with async_playwright() as p:
 
@@ -370,87 +779,174 @@ async def run_bot():
                 "height": 720
             },
             locale="pl-PL",
-            timezone_id="Europe/Warsaw"
+            timezone_id="Europe/Warsaw",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            )
         )
 
         olx_page = await context.new_page()
         vinted_page = await context.new_page()
 
-        first_scan = True
-
         while True:
-            started = time.monotonic()
 
-            log.info("🔎 ROZPOCZYNAM WSPÓLNY SKAN")
+            cycle_start = time.monotonic()
+
+            log.info(
+                "🔎 ROZPOCZYNAM WSPÓLNY SKAN"
+            )
 
             try:
-                offers = await scan_both(
+                all_results = await scan_both(
                     olx_page,
                     vinted_page
                 )
 
+                # ------------------------------------------------
+                # Usuwamy duplikaty po URL
+                # ------------------------------------------------
+
+                unique_results = []
+                urls_in_cycle = set()
+
+                for offer in all_results:
+                    offer_url = offer.get("url")
+
+                    if not offer_url:
+                        continue
+
+                    if offer_url in urls_in_cycle:
+                        continue
+
+                    urls_in_cycle.add(offer_url)
+                    unique_results.append(offer)
+
                 log.info(
-                    f"📦 Łącznie ofert: {len(offers)}"
+                    f"📦 Łącznie poprawnych ofert: "
+                    f"{len(unique_results)}"
                 )
 
-                new_count = 0
+                # ------------------------------------------------
+                # PIERWSZY SKAN
+                # ------------------------------------------------
 
                 if first_scan:
-                    for offer in offers:
-                        if offer.get("url"):
-                            known.add(offer["url"])
+
+                    for offer in unique_results:
+                        offer_url = offer.get("url")
+
+                        if offer_url:
+                            known.add(offer_url)
 
                     first_scan = False
 
                     log.info(
-                        f"🟢 Baza początkowa: {len(known)} ofert"
+                        f"🟢 Pierwszy skan — zapisano "
+                        f"{len(known)} istniejących ofert."
                     )
 
-                else:
-                    for offer in offers:
-                        url = offer.get("url")
+                    log.info(
+                        "🟢 Istniejące oferty NIE zostaną wysłane "
+                        "na Discord."
+                    )
 
-                        if not url or url in known:
+                # ------------------------------------------------
+                # KOLEJNE SKANY
+                # ------------------------------------------------
+
+                else:
+
+                    new_count = 0
+
+                    for offer in unique_results:
+
+                        offer_url = offer.get("url")
+
+                        if not offer_url:
                             continue
 
-                        known.add(url)
+                        if offer_url in known:
+                            continue
 
-                        send_discord(
-                            title=offer.get("title"),
-                            price=offer.get("price"),
-                            url=url,
-                            image=offer.get("image"),
-                            source=offer.get("source")
-                        )
+                        known.add(offer_url)
 
                         new_count += 1
 
+                        log.info(
+                            f"🆕 NOWA OFERTA [{offer.get('source')}] "
+                            f"{offer.get('title')}"
+                        )
+
+                        send_discord(
+                            title=offer.get(
+                                "title",
+                                "Nowe ogłoszenie"
+                            ),
+                            price=offer.get(
+                                "price",
+                                "Brak ceny"
+                            ),
+                            url=offer_url,
+                            image=offer.get(
+                                "image",
+                                ""
+                            ),
+                            source=offer.get(
+                                "source",
+                                ""
+                            )
+                        )
+
                         await asyncio.sleep(0.5)
 
-                log.info(
-                    f"🆕 Nowych ofert: {new_count}"
-                )
+                    log.info(
+                        f"🆕 Nowych ofert w tym skanie: "
+                        f"{new_count}"
+                    )
+
+                # ------------------------------------------------
+                # OGRANICZENIE PAMIĘCI
+                # ------------------------------------------------
+
+                if len(known) > 5000:
+                    known = set(
+                        list(known)[-3000:]
+                    )
 
             except Exception as e:
+
                 log.exception(
                     f"❌ Błąd wspólnego skanu: {e}"
                 )
 
-            elapsed = time.monotonic() - started
+            # ----------------------------------------------------
+            # Czekamy do następnego pełnego cyklu
+            # ----------------------------------------------------
 
-            wait = max(
+            elapsed = time.monotonic() - cycle_start
+
+            wait_time = max(
                 0,
                 SCAN_INTERVAL - elapsed
             )
 
             log.info(
-                f"⏱️ Następny skan za {wait:.1f}s"
+                f"⏱️ Następny wspólny skan za "
+                f"{wait_time:.1f} sekund"
             )
 
-            await asyncio.sleep(wait)
+            await asyncio.sleep(wait_time)
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
+
     web_thread = threading.Thread(
         target=start_web_server,
         daemon=True
