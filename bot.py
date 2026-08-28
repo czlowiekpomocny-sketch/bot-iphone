@@ -4,8 +4,8 @@ import logging
 import threading
 import time
 import json
-from urllib.parse import quote, urljoin
-from urllib.request import Request, urlopen
+from urllib.parse import quote
+from urllib.request import Request, urlopen, ProxyHandler, build_opener
 
 from flask import Flask
 
@@ -13,9 +13,15 @@ from flask import Flask
 # KONFIGURACJA
 # ============================================================
 
-SCAN_INTERVAL = 30          # Czas między skanami w sekundach
+SCAN_INTERVAL = 30          # Czas między skanami (sekundy)
 SEARCH_TEXT = "iphone"      # Szukana fraza
-MAX_RESULTS = 20            # Liczba ogłoszeń do sprawdzenia
+MAX_RESULTS = 20            # Liczba ogłoszeń
+
+# Dane Proxy wpisane na sztywno – zero konfiguracji na Renderze
+PROXY_HOST = "p.webshare.io"
+PROXY_PORT = "80"
+PROXY_USER = "pwbtcrfb"
+PROXY_PASS = "2rurdf9s0172"
 
 # ============================================================
 # LOGOWANIE
@@ -28,7 +34,7 @@ logging.basicConfig(
 log = logging.getLogger("iphone-bot")
 
 # ============================================================
-# FLASK (Utrzymanie aktywności na Renderze)
+# FLASK (Utrzymanie aktywności)
 # ============================================================
 
 app = Flask(__name__)
@@ -42,6 +48,28 @@ def start_web_server():
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ============================================================
+# POBIERANIE DANYCH PRZEZ PROXY
+# ============================================================
+
+def make_request(url, custom_headers=None):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pl-PL,pl;q=0.9",
+    }
+    if custom_headers:
+        headers.update(custom_headers)
+
+    req = Request(url, headers=headers)
+
+    proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+    proxy_support = ProxyHandler({'http': proxy_url, 'https': proxy_url})
+    opener = build_opener(proxy_support)
+
+    with opener.open(req, timeout=12) as resp:
+        return resp.read().decode("utf-8"), resp.headers
+
+# ============================================================
 # DISCORD
 # ============================================================
 
@@ -52,7 +80,7 @@ def get_webhook():
 async def send_discord(title, price, url, image="", source=""):
     webhook = get_webhook()
     if not webhook:
-        log.error("❌ BRAK DISCORD_WEBHOOK W ZMIENNYCH ENVIRONMENT!")
+        log.error("❌ BRAK DISCORD_WEBHOOK W ENVIRONMENT!")
         return False
 
     color = 23295 if source == "OLX" else 38550
@@ -72,10 +100,7 @@ async def send_discord(title, price, url, image="", source=""):
     req = Request(
         webhook, 
         data=payload, 
-        headers={
-            "Content-Type": "application/json", 
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        }
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
     )
 
     try:
@@ -85,111 +110,92 @@ async def send_discord(title, price, url, image="", source=""):
 
         status = await asyncio.to_thread(_post)
         if 200 <= status < 300:
-            log.info(f"🚀 [DISCORD] Wysyłanie powiadomienia: [{source}] {title[:30]}")
+            log.info(f"🚀 [DISCORD SENT] [{source}] {title[:30]}")
             return True
-        log.error(f"❌ Discord odpowiedział kodem: {status}")
     except Exception as e:
-        log.error(f"❌ Błąd wysyłania powiadomienia na Discord: {e}")
+        log.error(f"❌ Błąd Discord: {e}")
     return False
 
 # ============================================================
-# SKANER VINTED (Lekkie API HTTP)
+# SKANER VINTED
 # ============================================================
+
+def _fetch_vinted_session():
+    cookie_headers = {}
+    try:
+        _, resp_headers = make_request("https://www.vinted.pl")
+        cookies = resp_headers.get_all("Set-Cookie")
+        if cookies:
+            cookie_headers["Cookie"] = "; ".join([c.split(";")[0] for c in cookies])
+    except Exception:
+        pass
+    return cookie_headers
 
 def _fetch_vinted():
     found = []
     url = f"https://www.vinted.pl/api/v2/catalog/items?search_text={quote(SEARCH_TEXT)}&order=newest_first&per_page={MAX_RESULTS}"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "pl-PL,pl;q=0.9",
-    }
 
     try:
-        # Pobranie sesji
-        session_req = Request("https://www.vinted.pl", headers=headers)
-        cookie_str = ""
-        with urlopen(session_req, timeout=8) as resp:
-            cookies = resp.headers.get_all("Set-Cookie")
-            if cookies:
-                cookie_str = "; ".join([c.split(";")[0] for c in cookies])
+        headers = _fetch_vinted_session()
+        data_str, _ = make_request(url, custom_headers=headers)
+        data = json.loads(data_str)
 
-        if cookie_str:
-            headers["Cookie"] = cookie_str
+        items = data.get("items", [])
+        for item in items:
+            title = item.get("title") or "Oferta Vinted"
+            price_val = item.get("price") or item.get("total_item_price") or "Brak"
+            currency = item.get("currency") or "PLN"
 
-        req = Request(url, headers=headers)
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            items = data.get("items", [])
-            for item in items:
-                title = item.get("title") or "Oferta Vinted"
-                price_val = item.get("price") or item.get("total_item_price") or "Brak"
-                currency = item.get("currency") or "PLN"
-                
-                item_url = item.get("url")
-                if not item_url:
-                    item_id = item.get("id")
-                    item_url = f"https://www.vinted.pl/items/{item_id}"
+            item_url = item.get("url") or f"https://www.vinted.pl/items/{item.get('id')}"
+            photos = item.get("photos", [])
+            image = photos[0].get("url", "") if photos else ""
 
-                photos = item.get("photos", [])
-                image = photos[0].get("url", "") if photos else ""
-
-                found.append({
-                    "source": "Vinted",
-                    "url": item_url.split("?")[0],
-                    "title": title.strip(),
-                    "price": f"{price_val} {currency}",
-                    "image": image
-                })
+            found.append({
+                "source": "Vinted",
+                "url": item_url.split("?")[0],
+                "title": title.strip(),
+                "price": f"{price_val} {currency}",
+                "image": image
+            })
     except Exception as e:
         log.warning(f"⚠️ Vinted API pobieranie: {e}")
 
     return found
 
 # ============================================================
-# SKANER OLX (Lekkie pobieranie RSS/HTML)
+# SKANER OLX
 # ============================================================
 
 def _fetch_olx():
     found = []
-    # Zapytanie przez bezpośredni kanał danych/API OLX
     url = f"https://www.olx.pl/api/v1/offers/?offset=0&limit={MAX_RESULTS}&query={quote(SEARCH_TEXT)}&sort_by=created_at:desc"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
 
     try:
-        req = Request(url, headers=headers)
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            items = data.get("data", [])
-            for item in items:
-                title = item.get("title", "Oferta OLX")
-                item_url = item.get("url")
-                
-                # Cena
-                params = item.get("params", [])
-                price = "Brak ceny"
-                for p in params:
-                    if p.get("key") == "price":
-                        price = p.get("value", {}).get("label", "Brak cena")
-                        break
+        data_str, _ = make_request(url)
+        data = json.loads(data_str)
 
-                # Zdjęcie
-                photos = item.get("photos", [])
-                image = photos[0].get("link", "").replace("{width}", "600").replace("{height}", "460") if photos else ""
+        items = data.get("data", [])
+        for item in items:
+            title = item.get("title", "Oferta OLX")
+            item_url = item.get("url")
 
-                if item_url:
-                    found.append({
-                        "source": "OLX",
-                        "url": item_url.split("#")[0],
-                        "title": title.strip(),
-                        "price": price,
-                        "image": image
-                    })
+            price = "Brak ceny"
+            for p in item.get("params", []):
+                if p.get("key") == "price":
+                    price = p.get("value", {}).get("label", "Brak ceny")
+                    break
+
+            photos = item.get("photos", [])
+            image = photos[0].get("link", "").replace("{width}", "600").replace("{height}", "460") if photos else ""
+
+            if item_url:
+                found.append({
+                    "source": "OLX",
+                    "url": item_url.split("#")[0],
+                    "title": title.strip(),
+                    "price": price,
+                    "image": image
+                })
     except Exception as e:
         log.warning(f"⚠️ OLX API pobieranie: {e}")
 
@@ -201,10 +207,10 @@ def _fetch_olx():
 
 async def run_bot():
     if not get_webhook():
-        log.error("❌ BŁĄD: Brak zmiennej DISCORD_WEBHOOK w ustawieniach!")
+        log.error("❌ BŁĄD: Brak DISCORD_WEBHOOK w ustawieniach Rendera!")
         return
 
-    log.info("🚀 Uruchamianie bota w wersji API (Zero RAM-u, 100% szybkości)...")
+    log.info("🚀 Uruchamianie bota z gotowym proxy...")
 
     known_urls = set()
     first_scan = True
@@ -214,7 +220,6 @@ async def run_bot():
         log.info("--------------------------------------------------")
         log.info("🔄 Skanowanie w toku...")
 
-        # Pobieramy dane równolegle przez wątki HTTP (zamiast powolnego Playwrighta)
         vinted_offers = await asyncio.to_thread(_fetch_vinted)
         olx_offers = await asyncio.to_thread(_fetch_olx)
 
@@ -240,12 +245,11 @@ async def run_bot():
                 await asyncio.sleep(0.3)
 
         if first_scan:
-            log.info(f"🟢 Skan wstępny gotowy. Zapisano {len(known_urls)} istniejących ofert.")
-            log.info(f"🔎 OLX wykryto: {len(olx_offers)} | Vinted wykryto: {len(vinted_offers)}")
-            log.info("Czekam na NOWE ogłoszenia...")
+            log.info(f"🟢 Skan wstępny gotowy! OLX: {len(olx_offers)} | Vinted: {len(vinted_offers)}")
+            log.info("Czekam na nowe oferty...")
             first_scan = False
         else:
-            log.info(f"📦 Wysłąno powiadomień o nowych ofertach: {new_count}")
+            log.info(f"📦 Wysłąno nowych powiadomień: {new_count}")
 
         elapsed = time.monotonic() - scan_start
         sleep_time = max(0.0, SCAN_INTERVAL - elapsed)
