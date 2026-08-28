@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 import json
+import re
 from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
@@ -14,10 +15,10 @@ from playwright.async_api import async_playwright
 # KONFIGURACJA
 # ============================================================
 
-SCAN_INTERVAL = 30          # Przerwa między skanami (30s jest bezpieczniejsze dla RAMu)
+SCAN_INTERVAL = 25          # Przerwa między skanami (sekundy)
 SEARCH_TEXT = "iphone"      # Szukana fraza
-MAX_RESULTS = 30            # Liczba ogłoszeń do przeanalizowania na skan
-TIMEOUT = 30000             # Czas oczekiwania (30s)
+MAX_RESULTS = 30            # Liczba ogłoszeń
+TIMEOUT = 20000             # Max czas czekania (20s)
 
 # ============================================================
 # LOGOWANIE
@@ -95,7 +96,7 @@ async def send_discord(title, price, url, image="", source=""):
     return False
 
 # ============================================================
-# SKANER OLX
+# SKANER OLX (Poprawiona obsługa ciasteczek i nawigacji)
 # ============================================================
 
 async def scan_olx(page):
@@ -104,16 +105,17 @@ async def scan_olx(page):
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT)
-        await asyncio.sleep(2)
+        
+        # Szybkie zamknięcie banera RODO bez czekania 30s
+        try:
+            cookie_btn = page.locator("#onetrust-accept-btn-handler")
+            if await cookie_btn.is_visible(timeout=2000):
+                await cookie_btn.click(force=True, timeout=2000)
+        except Exception:
+            pass
 
-        # Baner RODO
-        cookie_btn = page.locator("#onetrust-accept-btn-handler")
-        if await cookie_btn.is_visible():
-            await cookie_btn.click()
-            await asyncio.sleep(1)
-
-        # Przewijanie dla wczytania obrazków
-        await page.evaluate("window.scrollBy(0, 600)")
+        await asyncio.sleep(1.5)
+        await page.evaluate("window.scrollBy(0, 500)")
         await asyncio.sleep(1)
 
         cards = page.locator('[data-cy="l-card"]')
@@ -160,58 +162,64 @@ async def scan_olx(page):
     return found
 
 # ============================================================
-# SKANER VINTED
+# SKANER VINTED (Szybkie i bezbłędne pobieranie HTTP)
 # ============================================================
 
-async def scan_vinted(page):
+def _fetch_vinted_http():
     found = []
-    api_url = f"https://www.vinted.pl/api/v2/catalog/items?search_text={quote(SEARCH_TEXT)}&order=newest_first&per_page={MAX_RESULTS}"
+    url = f"https://www.vinted.pl/api/v2/catalog/items?search_text={quote(SEARCH_TEXT)}&order=newest_first&per_page={MAX_RESULTS}"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pl-PL,pl;q=0.9",
+    }
 
     try:
-        response_data = await page.evaluate(f"""
-            async () => {{
-                try {{
-                    const res = await fetch("{api_url}", {{
-                        headers: {{ "Accept": "application/json, text/plain, */*" }}
-                    }});
-                    if (!res.ok) return {{ error: res.status }};
-                    return await res.json();
-                }} catch (e) {{
-                    return {{ error: e.toString() }};
-                }}
-            }}
-        """)
+        # Pobieranie wstępnych ciasteczek
+        session_req = Request("https://www.vinted.pl", headers=headers)
+        cookie_str = ""
+        with urlopen(session_req, timeout=8) as resp:
+            cookies = resp.headers.get_all("Set-Cookie")
+            if cookies:
+                cookie_str = "; ".join([c.split(";")[0] for c in cookies])
 
-        if "error" in response_data:
-            log.warning(f"⚠️ Vinted zgłosił błąd: {response_data['error']}")
-            return []
+        if cookie_str:
+            headers["Cookie"] = cookie_str
 
-        items = response_data.get("items", [])
-        for item in items:
-            title = item.get("title") or "Oferta Vinted"
-            price_val = item.get("price") or item.get("total_item_price") or "Brak ceny"
-            currency = item.get("currency") or "PLN"
-            price_str = f"{price_val} {currency}"
+        # Pobieranie danych ogłoszeń
+        req = Request(url, headers=headers)
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            items = data.get("items", [])
+            for item in items:
+                title = item.get("title") or "Oferta Vinted"
+                price_val = item.get("price") or item.get("total_item_price") or "Brak ceny"
+                currency = item.get("currency") or "PLN"
+                price_str = f"{price_val} {currency}"
 
-            url = item.get("url")
-            if not url:
-                item_id = item.get("id")
-                url = f"https://www.vinted.pl/items/{item_id}"
+                item_url = item.get("url")
+                if not item_url:
+                    item_id = item.get("id")
+                    item_url = f"https://www.vinted.pl/items/{item_id}"
 
-            photos = item.get("photos", [])
-            image = photos[0].get("url", "") if photos else ""
+                photos = item.get("photos", [])
+                image = photos[0].get("url", "") if photos else ""
 
-            found.append({
-                "source": "Vinted",
-                "url": url.split("?")[0],
-                "title": title.strip().replace("\n", " "),
-                "price": price_str,
-                "image": image
-            })
-
+                found.append({
+                    "source": "Vinted",
+                    "url": item_url.split("?")[0],
+                    "title": title.strip().replace("\n", " "),
+                    "price": price_str,
+                    "image": image
+                })
     except Exception as e:
-        log.warning(f"⚠️ Problem podczas pobierania Vinted: {e}")
+        log.warning(f"⚠️ Vinted HTTP pobieranie: {e}")
 
+    return found
+
+async def scan_vinted(page=None):
+    found = await asyncio.to_thread(_fetch_vinted_http)
     log.info(f"🔎 Vinted: Znaleziono {len(found)} ofert.")
     return found
 
@@ -244,25 +252,13 @@ async def run_bot():
 
         page = await context.new_page()
 
-        # Inicjalizacja sesji na Vinted (uzyskanie tokenów/cookies)
-        log.info("Rozpoczynam inicjalizację Vinted...")
-        try:
-            await page.goto("https://www.vinted.pl", wait_until="domcontentloaded", timeout=TIMEOUT)
-            await asyncio.sleep(2)
-            cookie_btn = page.locator('#onetrust-accept-btn-handler')
-            if await cookie_btn.is_visible():
-                await cookie_btn.click()
-        except Exception as e:
-            log.warning(f"⚠️ Błąd podczas inicjalizacji Vinted: {e}")
-
         while True:
             scan_start = time.monotonic()
             log.info("--------------------------------------------------")
             log.info("🔄 Skanowanie w toku...")
 
-            # Pobieramy po kolei na JEDNEJ karcie (dzięki temu Render nie wpada w brak pamięci RAM)
             olx_offers = await scan_olx(page)
-            vinted_offers = await scan_vinted(page)
+            vinted_offers = await scan_vinted()
 
             all_offers = olx_offers + vinted_offers
             new_count = 0
@@ -287,7 +283,6 @@ async def run_bot():
 
             if first_scan:
                 log.info(f"🟢 Pierwszy skan zakończony. Zapisano {len(known_urls)} istniejących ofert do pamięci.")
-                log.info("Gotowe! Teraz bot wyśle powiadomienie NA DISCORDA od razu, gdy pojawi się NOWE ogłoszenie.")
                 first_scan = False
             else:
                 log.info(f"📦 Zakończono skanowanie. Wysłąno nowych powiadomień: {new_count}")
