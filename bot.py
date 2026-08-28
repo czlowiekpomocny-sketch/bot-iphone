@@ -14,10 +14,10 @@ from playwright.async_api import async_playwright
 # KONFIGURACJA
 # ============================================================
 
-SCAN_INTERVAL = 15          # Czas przerwy między skanami (sekundy)
-SEARCH_TEXT = "iphone"      # Szukana fraza
-MAX_RESULTS = 50            # Maksymalna liczba analizowanych kart na skan
-PLAYWRIGHT_TIMEOUT = 30000  # Timeout dla ładowania stron (ms)
+SCAN_INTERVAL = 20          # Czas przerwy między skanami (sekundy)
+SEARCH_TEXT = "iphone"      # Wyszukiwana fraza
+MAX_RESULTS = 40            # Maksymalna liczba przetwarzanach ogłoszeń na skan
+PLAYWRIGHT_TIMEOUT = 30000  # Czas oczekiwania na załadowanie (ms)
 
 # ============================================================
 # LOGOWANIE
@@ -30,21 +30,21 @@ logging.basicConfig(
 log = logging.getLogger("iphone-bot")
 
 # ============================================================
-# FLASK (Keep-Alive dla serwerów chmurowych)
+# FLASK (Keep-Alive dla Rendera)
 # ============================================================
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "iPhone Flip Bot (OLX + Vinted) działa poprawnie."
+    return "iPhone Bot (OLX + Vinted) działa."
 
 def start_web_server():
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ============================================================
-# DISCORD (Wbudowane urllib — zerowa zależność od aiohttp)
+# DISCORD (Wysyłanie powiadomień)
 # ============================================================
 
 def get_webhook():
@@ -57,9 +57,7 @@ async def send_discord(title, price, url, image="", source=""):
         log.error("❌ Brak DISCORD_WEBHOOK w zmiennych środowiskowych.")
         return False
 
-    color = 38550  # Zielony dla OLX / Turkusowy dla Vinted
-    if source == "OLX":
-        color = 23295
+    color = 23295 if source == "OLX" else 38550
 
     embed = {
         "title": (title or "Nowe ogłoszenie")[:256],
@@ -93,7 +91,7 @@ async def send_discord(title, price, url, image="", source=""):
             return True
         log.error(f"❌ Discord odpowiedział kodem HTTP {status}")
     except Exception as e:
-        log.error(f"❌ Błąd podczas wysyłania powiadomienia na Discord: {e}")
+        log.error(f"❌ Błąd wysyłania powiadomienia na Discord: {e}")
     return False
 
 # ============================================================
@@ -102,27 +100,34 @@ async def send_discord(title, price, url, image="", source=""):
 
 async def scan_olx(page):
     found = []
-    # Poprawna struktura URL OLX wykluczająca błąd 404
     url = f"https://www.olx.pl/d/oferty/q-{quote(SEARCH_TEXT)}/?search%5Border%5D=created_at:desc"
 
     try:
-        await page.goto(url, wait_until="commit", timeout=PLAYWRIGHT_TIMEOUT)
+        await page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
         await asyncio.sleep(2)
         
         cookie_btn = page.locator("#onetrust-accept-btn-handler")
         if await cookie_btn.is_visible():
             await cookie_btn.click()
     except Exception as e:
-        log.warning(f"⚠️ OLX lądowanie/ciasteczka: {e}")
+        log.warning(f"⚠️ OLX lądowanie: {e}")
 
-    cards = page.locator('[data-cy="l-card"], [data-testid="l-card"]')
+    # Przewiń lekko stronę, aby upewnić się, że karty się doładowały
+    try:
+        await page.evaluate("window.scrollBy(0, 500)")
+        await asyncio.sleep(1)
+    except Exception:
+        pass
+
+    cards = page.locator('[data-cy="l-card"]')
     card_count = await cards.count()
 
     for i in range(min(card_count, MAX_RESULTS)):
         try:
             card = cards.nth(i)
-            link_elem = card.locator('a[href*="/d/oferta/"]').first
             
+            # Elastyczne szukanie linku
+            link_elem = card.locator('a[href*="/d/oferta/"]').first
             if await link_elem.count() == 0:
                 continue
 
@@ -132,12 +137,15 @@ async def scan_olx(page):
 
             full_url = urljoin("https://www.olx.pl", href).split("?")[0]
 
-            title_elem = card.locator('h6, h4, [data-testid="ad-title"]').first
+            # Pobieranie tytułu
+            title_elem = card.locator('[data-cy="ad-card-title"], h6, h4').first
             title = await title_elem.inner_text() if await title_elem.count() > 0 else "Ogłoszenie OLX"
 
-            price_elem = card.locator('[data-testid="ad-price"]').first
+            # Pobieranie ceny
+            price_elem = card.locator('[data-element-type="price"], [data-testid="ad-price"]').first
             price = await price_elem.inner_text() if await price_elem.count() > 0 else "Brak ceny"
 
+            # Pobieranie obrazka
             img_elem = card.locator("img").first
             image = ""
             if await img_elem.count() > 0:
@@ -165,16 +173,23 @@ async def scan_vinted(page):
     url = f"https://www.vinted.pl/catalog?search_text={quote(SEARCH_TEXT)}&order=newest_first"
 
     try:
-        await page.goto(url, wait_until="commit", timeout=PLAYWRIGHT_TIMEOUT)
-        await asyncio.sleep(2)
+        await page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
+        await asyncio.sleep(3)
 
         cookie_btn = page.locator('#onetrust-accept-btn-handler')
         if await cookie_btn.is_visible():
             await cookie_btn.click()
     except Exception as e:
-        log.warning(f"⚠️ Vinted lądowanie/ciasteczka: {e}")
+        log.warning(f"⚠️ Vinted lądowanie: {e}")
 
-    items = page.locator('[data-testid="grid-item"]')
+    # Symulacja przewijania, aby Vinted wyrenderował Siatkę (Grid)
+    try:
+        await page.evaluate("window.scrollBy(0, 600)")
+        await asyncio.sleep(1)
+    except Exception:
+        pass
+
+    items = page.locator('[data-testid="grid-item"], [data-testid="item-box"]')
     item_count = await items.count()
 
     for i in range(min(item_count, MAX_RESULTS)):
@@ -223,7 +238,7 @@ async def scan_vinted(page):
 
 async def run_bot():
     if not get_webhook():
-        log.error("❌ BŁĄD: DISCORD_WEBHOOK nie jest ustawiony w Environment Variables w Renderze!")
+        log.error("❌ BŁĄD: DISCORD_WEBHOOK nie jest ustawiony w Environment Variables na Renderze!")
         return
 
     log.info("🚀 Uruchamianie iPhone Bot (OLX + Vinted)...")
@@ -242,10 +257,10 @@ async def run_bot():
             ]
         )
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1366, "height": 768},
             locale="pl-PL",
             timezone_id="Europe/Warsaw",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
         )
 
         olx_page = await context.new_page()
@@ -266,7 +281,7 @@ async def run_bot():
                 if isinstance(res, list):
                     all_offers.extend(res)
                 else:
-                    log.error(f"❌ Wyjątek podczas wykonywania skanu: {res}")
+                    log.error(f"❌ Błąd skanowania: {res}")
 
             new_count = 0
             for offer in all_offers:
@@ -276,7 +291,7 @@ async def run_bot():
 
                 known_urls.add(url)
 
-                # Pierwszy skan ignorujemy, aby nie wysłać kilkudziesięciu starych ofert naraz
+                # Pierwszy skan ignoruje stare oferty
                 if not first_scan:
                     new_count += 1
                     log.info(f"🆕 Nowa oferta! [{offer['source']}] {offer['title']} - {offer['price']}")
@@ -290,10 +305,10 @@ async def run_bot():
                     await asyncio.sleep(0.5)
 
             if first_scan:
-                log.info(f"🟢 Pierwszy skan zakończony powodzeniem. Zapisano {len(known_urls)} istniejących ofert do pamięci.")
+                log.info(f"🟢 Pierwszy skan zakończony. Zapisano {len(known_urls)} istniejących ofert.")
                 first_scan = False
             else:
-                log.info(f"📦 Zakończono skan. Wysłąno nowych powiadomień: {new_count}")
+                log.info(f"📦 Zakończono skanowanie. Nowych ofert wysłanych na Discorda: {new_count}")
 
             elapsed = time.monotonic() - scan_start
             sleep_time = max(0.0, SCAN_INTERVAL - elapsed)
