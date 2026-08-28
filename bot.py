@@ -16,8 +16,8 @@ from playwright.async_api import async_playwright
 
 SCAN_INTERVAL = 20          # Czas przerwy między skanami (sekundy)
 SEARCH_TEXT = "iphone"      # Wyszukiwana fraza
-MAX_RESULTS = 40            # Maksymalna liczba przetwarzanach ogłoszeń na skan
-PLAYWRIGHT_TIMEOUT = 30000  # Czas oczekiwania na załadowanie (ms)
+MAX_RESULTS = 40            # Maksymalna liczba ogłoszeń na skan
+PLAYWRIGHT_TIMEOUT = 25000  # Czas oczekiwania dla OLX (ms)
 
 # ============================================================
 # LOGOWANIE
@@ -37,7 +37,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "iPhone Bot (OLX + Vinted) działa."
+    return "iPhone Bot (OLX + Vinted API) działa."
 
 def start_web_server():
     port = int(os.environ.get("PORT", "10000"))
@@ -89,13 +89,13 @@ async def send_discord(title, price, url, image="", source=""):
         if 200 <= status < 300:
             log.info(f"✅ Discord [{source}]: wysłano -> {(title or 'Ogłoszenie')[:40]}")
             return True
-        log.error(f"❌ Discord odpowiedział kodem HTTP {status}")
+        log.error(f"❌ Discord HTTP {status}")
     except Exception as e:
         log.error(f"❌ Błąd wysyłania powiadomienia na Discord: {e}")
     return False
 
 # ============================================================
-# SKANER OLX
+# SKANER OLX (Playwright)
 # ============================================================
 
 async def scan_olx(page):
@@ -112,9 +112,8 @@ async def scan_olx(page):
     except Exception as e:
         log.warning(f"⚠️ OLX lądowanie: {e}")
 
-    # Przewiń lekko stronę, aby upewnić się, że karty się doładowały
     try:
-        await page.evaluate("window.scrollBy(0, 500)")
+        await page.evaluate("window.scrollBy(0, 400)")
         await asyncio.sleep(1)
     except Exception:
         pass
@@ -125,8 +124,6 @@ async def scan_olx(page):
     for i in range(min(card_count, MAX_RESULTS)):
         try:
             card = cards.nth(i)
-            
-            # Elastyczne szukanie linku
             link_elem = card.locator('a[href*="/d/oferta/"]').first
             if await link_elem.count() == 0:
                 continue
@@ -137,15 +134,12 @@ async def scan_olx(page):
 
             full_url = urljoin("https://www.olx.pl", href).split("?")[0]
 
-            # Pobieranie tytułu
             title_elem = card.locator('[data-cy="ad-card-title"], h6, h4').first
             title = await title_elem.inner_text() if await title_elem.count() > 0 else "Ogłoszenie OLX"
 
-            # Pobieranie ceny
             price_elem = card.locator('[data-element-type="price"], [data-testid="ad-price"]').first
             price = await price_elem.inner_text() if await price_elem.count() > 0 else "Brak ceny"
 
-            # Pobieranie obrazka
             img_elem = card.locator("img").first
             image = ""
             if await img_elem.count() > 0:
@@ -165,71 +159,68 @@ async def scan_olx(page):
     return found
 
 # ============================================================
-# SKANER VINTED
+# SKANER VINTED (Szybkie API HTTP - Ominięcie Cloudflare/Timeoutów)
 # ============================================================
 
-async def scan_vinted(page):
+def _fetch_vinted_api():
     found = []
-    url = f"https://www.vinted.pl/catalog?search_text={quote(SEARCH_TEXT)}&order=newest_first"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"
+    }
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
-        await asyncio.sleep(3)
+        # 1. Pobieranie sesji i ciasteczek
+        init_req = Request("https://www.vinted.pl", headers=headers)
+        cookie_header = ""
+        with urlopen(init_req, timeout=10) as resp:
+            cookies = resp.headers.get_all('Set-Cookie')
+            if cookies:
+                cookie_header = "; ".join([c.split(';')[0] for c in cookies])
 
-        cookie_btn = page.locator('#onetrust-accept-btn-handler')
-        if await cookie_btn.is_visible():
-            await cookie_btn.click()
-    except Exception as e:
-        log.warning(f"⚠️ Vinted lądowanie: {e}")
-
-    # Symulacja przewijania, aby Vinted wyrenderował Siatkę (Grid)
-    try:
-        await page.evaluate("window.scrollBy(0, 600)")
-        await asyncio.sleep(1)
-    except Exception:
-        pass
-
-    items = page.locator('[data-testid="grid-item"], [data-testid="item-box"]')
-    item_count = await items.count()
-
-    for i in range(min(item_count, MAX_RESULTS)):
-        try:
-            item = items.nth(i)
-            link_elem = item.locator('a[href*="/items/"]').first
+        headers["Cookie"] = cookie_header
+        
+        # 2. Strzał do wewnętrznego API Vinted
+        api_url = f"https://www.vinted.pl/api/v2/catalog/items?search_text={quote(SEARCH_TEXT)}&order=newest_first&per_page={MAX_RESULTS}"
+        api_req = Request(api_url, headers=headers)
+        
+        with urlopen(api_req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            items = data.get("items", [])
             
-            if await link_elem.count() == 0:
-                continue
+            for item in items:
+                title = item.get("title") or "Ogłoszenie Vinted"
+                price_val = item.get("price") or item.get("total_item_price") or "Brak ceny"
+                currency = item.get("currency") or "PLN"
+                price_str = f"{price_val} {currency}"
+                
+                url = item.get("url")
+                if not url:
+                    item_id = item.get("id")
+                    url = f"https://www.vinted.pl/items/{item_id}"
+                
+                # Pobranie miniaturki
+                photos = item.get("photos", [])
+                image = photos[0].get("url", "") if photos else ""
+                
+                found.append({
+                    "source": "Vinted",
+                    "url": url.split("?")[0],
+                    "title": title.strip().replace("\n", " "),
+                    "price": price_str,
+                    "image": image
+                })
 
-            href = await link_elem.get_attribute("href")
-            if not href:
-                continue
+    except Exception as e:
+        log.warning(f"⚠️ Vinted API pobieranie: {e}")
 
-            full_url = urljoin("https://www.vinted.pl", href).split("?")[0]
+    return found
 
-            title = await link_elem.get_attribute("title")
-            if not title:
-                raw_text = await item.inner_text()
-                title = raw_text.split("\n")[0] if raw_text else "Ogłoszenie Vinted"
-
-            price_elem = item.locator('[data-testid*="price"]').first
-            price = await price_elem.inner_text() if await price_elem.count() > 0 else "Brak ceny"
-
-            img_elem = item.locator("img").first
-            image = ""
-            if await img_elem.count() > 0:
-                image = await img_elem.get_attribute("src") or await img_elem.get_attribute("data-src") or ""
-
-            found.append({
-                "source": "Vinted",
-                "url": full_url,
-                "title": title.strip().replace("\n", " "),
-                "price": price.strip().replace("\n", " "),
-                "image": image
-            })
-        except Exception:
-            continue
-
-    log.info(f"Vinted: odnaleziono {len(found)} poprawnych ofert")
+async def scan_vinted_api():
+    # Wywołanie w osobnym wątku, aby nie blokować event loopa asyncio
+    found = await asyncio.to_thread(_fetch_vinted_api)
+    log.info(f"Vinted (API): odnaleziono {len(found)} poprawnych ofert")
     return found
 
 # ============================================================
@@ -241,7 +232,7 @@ async def run_bot():
         log.error("❌ BŁĄD: DISCORD_WEBHOOK nie jest ustawiony w Environment Variables na Renderze!")
         return
 
-    log.info("🚀 Uruchamianie iPhone Bot (OLX + Vinted)...")
+    log.info("🚀 Uruchamianie iPhone Bot (OLX + Vinted API)...")
 
     known_urls = set()
     first_scan = True
@@ -264,15 +255,14 @@ async def run_bot():
         )
 
         olx_page = await context.new_page()
-        vinted_page = await context.new_page()
 
         while True:
             scan_start = time.monotonic()
-            log.info("🔎 Rozpoczynam skanowanie OLX oraz Vinted...")
+            log.info("🔎 Rozpoczynam skanowanie OLX (Playwright) oraz Vinted (API REST)...")
 
             results = await asyncio.gather(
                 scan_olx(olx_page),
-                scan_vinted(vinted_page),
+                scan_vinted_api(),
                 return_exceptions=True
             )
 
@@ -291,7 +281,6 @@ async def run_bot():
 
                 known_urls.add(url)
 
-                # Pierwszy skan ignoruje stare oferty
                 if not first_scan:
                     new_count += 1
                     log.info(f"🆕 Nowa oferta! [{offer['source']}] {offer['title']} - {offer['price']}")
@@ -305,10 +294,10 @@ async def run_bot():
                     await asyncio.sleep(0.5)
 
             if first_scan:
-                log.info(f"🟢 Pierwszy skan zakończony. Zapisano {len(known_urls)} istniejących ofert.")
+                log.info(f"🟢 Pierwszy skan zakończony. Zapisano {len(known_urls)} istniejących ofert do pamięci podglądu.")
                 first_scan = False
             else:
-                log.info(f"📦 Zakończono skanowanie. Nowych ofert wysłanych na Discorda: {new_count}")
+                log.info(f"📦 Zakończono skanowanie. Wysłąno nowych powiadomień: {new_count}")
 
             elapsed = time.monotonic() - scan_start
             sleep_time = max(0.0, SCAN_INTERVAL - elapsed)
