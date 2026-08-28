@@ -29,7 +29,7 @@ logging.basicConfig(
 log = logging.getLogger("iphone-bot")
 
 # ============================================================
-# FLASK (Keep-Alive dla serwerów chmurowych)
+# FLASK (Keep-Alive dla Render / Heroku)
 # ============================================================
 
 app = Flask(__name__)
@@ -87,7 +87,6 @@ async def scan_olx(page):
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
-        # Odrzucenie banera cookies jeśli się pojawi
         cookie_btn = page.locator("#onetrust-accept-btn-handler")
         if await cookie_btn.is_visible():
             await cookie_btn.click()
@@ -114,15 +113,12 @@ async def scan_olx(page):
 
             full_url = urljoin("https://www.olx.pl", href).split("?")[0]
 
-            # Tytuł
             title_elem = card.locator('h6, h4, [data-testid="ad-title"]').first
             title = await title_elem.inner_text() if await title_elem.count() > 0 else "Ogłoszenie OLX"
 
-            # Cena
             price_elem = card.locator('[data-testid="ad-price"]').first
             price = await price_elem.inner_text() if await price_elem.count() > 0 else "Brak ceny"
 
-            # Zdjęcie
             img_elem = card.locator("img").first
             image = ""
             if await img_elem.count() > 0:
@@ -176,17 +172,14 @@ async def scan_vinted(page):
 
             full_url = urljoin("https://www.vinted.pl", href).split("?")[0]
 
-            # Tytuł
             title = await link_elem.get_attribute("title")
             if not title:
                 raw_text = await item.inner_text()
                 title = raw_text.split("\n")[0] if raw_text else "Ogłoszenie Vinted"
 
-            # Cena
             price_elem = item.locator('[data-testid*="price"]').first
             price = await price_elem.inner_text() if await price_elem.count() > 0 else "Brak ceny"
 
-            # Zdjęcie
             img_elem = item.locator("img").first
             image = ""
             if await img_elem.count() > 0:
@@ -258,7 +251,6 @@ async def run_bot():
 
                 known_urls.add(url)
 
-                # Nie wysyłaj starych ofert zebranych podczas pierwszego uruchomienia
                 if not first_scan:
                     new_count += 1
                     log.info(f"🆕 [{offer['source']}] {offer['title']} - {offer['price']}")
@@ -288,9 +280,7 @@ async def run_bot():
 # ============================================================
 
 if __name__ == "__main__":
-    # Start serwera HTTP w osobnym wątku (dla serwisów typu Render/Heroku)
     web_thread = threading.Thread(target=start_web_server, daemon=True)
     web_thread.start()
 
-    # Uruchomienie pętli asynchronicznej bota
     asyncio.run(run_bot())
