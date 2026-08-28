@@ -823,4 +823,3 @@ web_thread = threading.Thread(
 web_thread.start()
 
 asyncio.run(run_bot())
-```
