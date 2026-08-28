@@ -3,9 +3,10 @@ import asyncio
 import logging
 import threading
 import time
+import json
 from urllib.parse import quote, urljoin
+from urllib.request import Request, urlopen
 
-import aiohttp
 from flask import Flask
 from playwright.async_api import async_playwright
 
@@ -13,10 +14,10 @@ from playwright.async_api import async_playwright
 # KONFIGURACJA
 # ============================================================
 
-SCAN_INTERVAL = 15
-SEARCH_TEXT = "iphone"
-MAX_RESULTS = 100
-PLAYWRIGHT_TIMEOUT = 15000
+SCAN_INTERVAL = 15          # Czas przerwy między skanami (sekundy)
+SEARCH_TEXT = "iphone"      # Szukana fraza
+MAX_RESULTS = 50            # Maksymalna liczba analizowanych kart na skan
+PLAYWRIGHT_TIMEOUT = 30000  # Timeout dla ładowania stron (ms)
 
 # ============================================================
 # LOGOWANIE
@@ -29,52 +30,70 @@ logging.basicConfig(
 log = logging.getLogger("iphone-bot")
 
 # ============================================================
-# FLASK (Keep-Alive dla Render / Heroku)
+# FLASK (Keep-Alive dla serwerów chmurowych)
 # ============================================================
 
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "iPhone Flip Bot działa."
+    return "iPhone Flip Bot (OLX + Vinted) działa poprawnie."
 
 def start_web_server():
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ============================================================
-# DISCORD (Asynchroniczny)
+# DISCORD (Wbudowane urllib — zerowa zależność od aiohttp)
 # ============================================================
 
 def get_webhook():
     webhook = os.environ.get("DISCORD_WEBHOOK")
     return webhook.strip() if webhook else None
 
-async def send_discord(session, title, price, url, image="", source=""):
+async def send_discord(title, price, url, image="", source=""):
     webhook = get_webhook()
     if not webhook:
-        log.error("❌ Brak DISCORD_WEBHOOK.")
+        log.error("❌ Brak DISCORD_WEBHOOK w zmiennych środowiskowych.")
         return False
+
+    color = 38550  # Zielony dla OLX / Turkusowy dla Vinted
+    if source == "OLX":
+        color = 23295
 
     embed = {
         "title": (title or "Nowe ogłoszenie")[:256],
         "url": url,
-        "color": 5814783 if source == "OLX" else 65490,
+        "color": color,
         "description": f"💰 **Cena:** {price or 'Brak ceny'}\n🌐 **Źródło:** {source}",
-        "footer": {"text": "iPhone Flip Bot"}
+        "footer": {"text": "iPhone Notifier Bot"}
     }
 
     if image and image.startswith("http"):
         embed["thumbnail"] = {"url": image}
 
+    payload = json.dumps({"embeds": [embed]}).encode("utf-8")
+    req = Request(
+        webhook, 
+        data=payload, 
+        headers={
+            "Content-Type": "application/json", 
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+        }
+    )
+
     try:
-        async with session.post(webhook, json={"embeds": [embed]}, timeout=10) as resp:
-            if 200 <= resp.status < 300:
-                log.info(f"✅ Discord [{source}]: wysłano -> {(title or 'Ogłoszenie')[:50]}")
-                return True
-            log.error(f"❌ Discord HTTP {resp.status}")
+        def _post():
+            with urlopen(req, timeout=10) as resp:
+                return resp.status
+
+        status = await asyncio.to_thread(_post)
+        if 200 <= status < 300:
+            log.info(f"✅ Discord [{source}]: wysłano -> {(title or 'Ogłoszenie')[:40]}")
+            return True
+        log.error(f"❌ Discord odpowiedział kodem HTTP {status}")
     except Exception as e:
-        log.error(f"❌ Błąd wysyłania Discord: {e}")
+        log.error(f"❌ Błąd podczas wysyłania powiadomienia na Discord: {e}")
     return False
 
 # ============================================================
@@ -83,21 +102,21 @@ async def send_discord(session, title, price, url, image="", source=""):
 
 async def scan_olx(page):
     found = []
-    url = f"https://www.olx.pl/d/elektronika/telefony/telefony-komorkowe/q-{quote(SEARCH_TEXT)}/?search%5Border%5D=created_at:desc"
+    # Poprawna struktura URL OLX wykluczająca błąd 404
+    url = f"https://www.olx.pl/d/oferty/q-{quote(SEARCH_TEXT)}/?search%5Border%5D=created_at:desc"
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
+        await page.goto(url, wait_until="commit", timeout=PLAYWRIGHT_TIMEOUT)
+        await asyncio.sleep(2)
+        
         cookie_btn = page.locator("#onetrust-accept-btn-handler")
         if await cookie_btn.is_visible():
             await cookie_btn.click()
     except Exception as e:
-        log.warning(f"⚠️ OLX goto/cookie: {e}")
-
-    await asyncio.sleep(2)
+        log.warning(f"⚠️ OLX lądowanie/ciasteczka: {e}")
 
     cards = page.locator('[data-cy="l-card"], [data-testid="l-card"]')
     card_count = await cards.count()
-    log.info(f"OLX: odnaleziono {card_count} kart")
 
     for i in range(min(card_count, MAX_RESULTS)):
         try:
@@ -134,6 +153,7 @@ async def scan_olx(page):
         except Exception:
             continue
 
+    log.info(f"OLX: odnaleziono {len(found)} poprawnych ofert")
     return found
 
 # ============================================================
@@ -145,18 +165,17 @@ async def scan_vinted(page):
     url = f"https://www.vinted.pl/catalog?search_text={quote(SEARCH_TEXT)}&order=newest_first"
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_TIMEOUT)
+        await page.goto(url, wait_until="commit", timeout=PLAYWRIGHT_TIMEOUT)
+        await asyncio.sleep(2)
+
         cookie_btn = page.locator('#onetrust-accept-btn-handler')
         if await cookie_btn.is_visible():
             await cookie_btn.click()
     except Exception as e:
-        log.warning(f"⚠️ Vinted goto/cookie: {e}")
-
-    await asyncio.sleep(2)
+        log.warning(f"⚠️ Vinted lądowanie/ciasteczka: {e}")
 
     items = page.locator('[data-testid="grid-item"]')
     item_count = await items.count()
-    log.info(f"Vinted: odnaleziono {item_count} kart")
 
     for i in range(min(item_count, MAX_RESULTS)):
         try:
@@ -188,33 +207,39 @@ async def scan_vinted(page):
             found.append({
                 "source": "Vinted",
                 "url": full_url,
-                "title": title.strip(),
-                "price": price.strip(),
+                "title": title.strip().replace("\n", " "),
+                "price": price.strip().replace("\n", " "),
                 "image": image
             })
         except Exception:
             continue
 
+    log.info(f"Vinted: odnaleziono {len(found)} poprawnych ofert")
     return found
 
 # ============================================================
-# GŁÓWNA PĘTLA BOT-A
+# GŁÓWNA PĘTLA BOTA
 # ============================================================
 
 async def run_bot():
     if not get_webhook():
-        log.error("❌ DISCORD_WEBHOOK nie został skonfigurowany w zmiennych środowiskowych.")
+        log.error("❌ BŁĄD: DISCORD_WEBHOOK nie jest ustawiony w Environment Variables w Renderze!")
         return
 
-    log.info("🚀 Uruchamianie iPhone Flip Bot (OLX + Vinted)...")
+    log.info("🚀 Uruchamianie iPhone Bot (OLX + Vinted)...")
 
     known_urls = set()
     first_scan = True
 
-    async with async_playwright() as p, aiohttp.ClientSession() as http_session:
+    async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            args=[
+                "--no-sandbox", 
+                "--disable-setuid-sandbox", 
+                "--disable-dev-shm-usage", 
+                "--disable-gpu"
+            ]
         )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 720},
@@ -228,7 +253,7 @@ async def run_bot():
 
         while True:
             scan_start = time.monotonic()
-            log.info("🔎 Rozpoczynam skanowanie serwisów...")
+            log.info("🔎 Rozpoczynam skanowanie OLX oraz Vinted...")
 
             results = await asyncio.gather(
                 scan_olx(olx_page),
@@ -241,7 +266,7 @@ async def run_bot():
                 if isinstance(res, list):
                     all_offers.extend(res)
                 else:
-                    log.error(f"❌ Błąd podczas skanowania: {res}")
+                    log.error(f"❌ Wyjątek podczas wykonywania skanu: {res}")
 
             new_count = 0
             for offer in all_offers:
@@ -251,11 +276,11 @@ async def run_bot():
 
                 known_urls.add(url)
 
+                # Pierwszy skan ignorujemy, aby nie wysłać kilkudziesięciu starych ofert naraz
                 if not first_scan:
                     new_count += 1
-                    log.info(f"🆕 [{offer['source']}] {offer['title']} - {offer['price']}")
+                    log.info(f"🆕 Nowa oferta! [{offer['source']}] {offer['title']} - {offer['price']}")
                     await send_discord(
-                        http_session,
                         title=offer["title"],
                         price=offer["price"],
                         url=url,
@@ -265,18 +290,18 @@ async def run_bot():
                     await asyncio.sleep(0.5)
 
             if first_scan:
-                log.info(f"🟢 Pierwszy skan zakończony. Zapisano {len(known_urls)} istniejących ofert.")
+                log.info(f"🟢 Pierwszy skan zakończony powodzeniem. Zapisano {len(known_urls)} istniejących ofert do pamięci.")
                 first_scan = False
             else:
-                log.info(f"📦 Zakończono skan. Nowych ofert: {new_count}")
+                log.info(f"📦 Zakończono skan. Wysłąno nowych powiadomień: {new_count}")
 
             elapsed = time.monotonic() - scan_start
             sleep_time = max(0.0, SCAN_INTERVAL - elapsed)
-            log.info(f"⏱️ Czas skanowania: {elapsed:.1f}s. Czekam {sleep_time:.1f}s...")
+            log.info(f"⏱️ Czas skanowania: {elapsed:.1f}s. Następny skan za {sleep_time:.1f}s.")
             await asyncio.sleep(sleep_time)
 
 # ============================================================
-# PUNKT WEJŚCIA PROGRAMU
+# START
 # ============================================================
 
 if __name__ == "__main__":
